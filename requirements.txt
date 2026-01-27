@@ -1,0 +1,9 @@
+numpy>=1.23.0
+diffusers>=0.27.0
+Pillow>=9.0.0
+imageio>=2.22.0
+opencv-python>=4.7.0
+einops>=0.6.0
+safetensors>=0.3.0
+typing-extensions>=4.0.0
+diffrp-nvdiffrast

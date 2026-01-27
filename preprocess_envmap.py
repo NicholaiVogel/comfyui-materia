@@ -113,24 +113,26 @@ def rgb2srgb_official(rgb: torch.Tensor) -> torch.Tensor:
                       1.055 * torch.pow(torch.clamp(rgb, 1e-8, 1.0), 1.0/2.4) - 0.055)
 
 def reinhard_official(x: torch.Tensor, max_point: float = 16.0) -> torch.Tensor:
-    """Official Reinhard tone mapping"""
-    return x / (x + 1.0) * max_point
+    """Extended Reinhard tone mapping with white point.
+    Matches NVIDIA reference: rendering_utils.py:147-152"""
+    return x * (1 + x / (max_point ** 2)) / (1 + x)
 
-def hdr_mapping_official(env_hdr: torch.Tensor, log_scale: float = 10000.0) -> Dict[str, torch.Tensor]:
+def hdr_mapping_official(env_hdr: torch.Tensor, max_point: float = 16.0, log_scale: float = 10000.0) -> Dict[str, torch.Tensor]:
     """
     Official HDR tone mapping matching Cosmos1 implementation
-    
+
     Args:
-        env_hdr: HDR environment tensor
+        env_hdr: HDR environment tensor (linear light)
+        max_point: Reinhard white point
         log_scale: Scale factor for logarithmic encoding
-        
+
     Returns:
         Dictionary with 'env_hdr', 'env_ev0' (LDR), 'env_log' versions
     """
     # Reinhard tone mapping for LDR version
-    env_ev0 = rgb2srgb_official(reinhard_official(env_hdr, max_point=16.0).clamp(0, 1))
-    
-    # Logarithmic encoding for HDR version  
+    env_ev0 = rgb2srgb_official(reinhard_official(env_hdr, max_point=max_point).clamp(0, 1))
+
+    # Logarithmic encoding for HDR version
     env_log = rgb2srgb_official(torch.log1p(env_hdr) / np.log1p(log_scale)).clamp(0, 1)
     
     return {
@@ -337,6 +339,11 @@ def latlong_vec(res: Tuple[int, int], device: str = 'cuda') -> torch.Tensor:
     
     return dir_vec
 
+def envmap_vec(res: Tuple[int, int], device: str = 'cuda') -> torch.Tensor:
+    """Generate environment map direction vectors.
+    Matches NVIDIA reference: rendering_utils.py:90-91"""
+    return -latlong_vec(res, device).flip(0).flip(1)
+
 def rotate_y(angle: float, device: str = 'cuda') -> torch.Tensor:
     """Generate Y-axis rotation matrix"""
     cos_a, sin_a = np.cos(angle), np.sin(angle)
@@ -410,57 +417,69 @@ def render_projection_from_panorama(
     env_rot: float = 180.0,
     device: str = 'cuda',
     num_frames: int = 1,
-    use_cache: bool = True, # Add this for control
+    use_cache: bool = True,
+    max_point: float = 16.0,
+    log_scale: float = 10000.0,
     **kwargs
 ) -> Dict[str, torch.Tensor]:
     """
     Takes a panoramic HDR and renders a perspective-correct projection from it.
     This is the full "Panorama -> Cubemap -> Projected View" pipeline.
     """
+    cache_fmt = f'proj_mp{max_point}_ls{log_scale}'
     if use_cache:
-        # Generate a unique hash for the input tensor/path
         if isinstance(env_input, torch.Tensor):
             env_hash = compute_tensor_hash(env_input)
         else:
             env_hash = hashlib.md5(str(env_input).encode()).hexdigest()
-        
-        # Check the cache using all relevant parameters
-        cached_result = _env_cache.get(env_hash, resolution, 'proj', env_brightness, env_flip, env_rot)
+
+        cached_result = _env_cache.get(
+            env_hash, resolution, cache_fmt,
+            env_brightness, env_flip, env_rot,
+        )
         if cached_result is not None:
-            logger.debug("Using cached panoramic projection ('proj')")
+            logger.debug("Using cached panoramic projection")
             return cached_result
 
     H, W = resolution
-    
-    # The rest of the function is the "cache miss" logic
-    cubemap = load_and_preprocess_hdr_robust(env_input, env_brightness, env_flip, env_rot, device)
+
+    cubemap = load_and_preprocess_hdr_robust(
+        env_input, env_brightness, env_flip, env_rot, device,
+    )
     vec = latlong_vec((H, W), device=device)
     c2w = torch.eye(4, device=device)
     y_rot = rotate_y(0.0, device=device)
-    
+
     vec_cam = vec.view(-1, 3) @ c2w[:3, :3].T
     vec_query = (vec_cam @ y_rot[:3, :3].T).view(1, H, W, 3)
-    env_proj = dr.texture(cubemap.unsqueeze(0), -vec_query.contiguous(),
-                          filter_mode='linear', boundary_mode='cube')[0]
+    env_proj = dr.texture(
+        cubemap.unsqueeze(0), -vec_query.contiguous(),
+        filter_mode='linear', boundary_mode='cube',
+    )[0]
     env_proj = torch.flip(env_proj, dims=[0, 1])
-    
-    mapping_results = hdr_mapping_official(env_proj, log_scale=10000.0)
-    
+
+    mapping_results = hdr_mapping_official(
+        env_proj, max_point=max_point, log_scale=log_scale,
+    )
+
     env_ldr = mapping_results['env_ev0']
     env_log = mapping_results['env_log']
-    
+
     if num_frames > 1:
         env_ldr = env_ldr.unsqueeze(0).expand(num_frames, -1, -1, -1)
         env_log = env_log.unsqueeze(0).expand(num_frames, -1, -1, -1)
     else:
         env_ldr = env_ldr.unsqueeze(0)
         env_log = env_log.unsqueeze(0)
-        
+
     result = {'env_ldr': env_ldr, 'env_log': env_log}
-    
+
     if use_cache:
-        _env_cache.put(env_hash, resolution, 'proj', env_brightness, env_flip, env_rot, result)
-        
+        _env_cache.put(
+            env_hash, resolution, cache_fmt,
+            env_brightness, env_flip, env_rot, result,
+        )
+
     return result
 
 def tonemap_image_direct(
@@ -468,58 +487,74 @@ def tonemap_image_direct(
     resolution: Tuple[int, int],
     device: str = 'cuda',
     num_frames: int = 1,
-    use_cache: bool = True, # Add this for control
+    use_cache: bool = True,
+    max_point: float = 16.0,
+    log_scale: float = 10000.0,
+    env_brightness: float = 1.0,
+    env_flip: bool = False,
+    env_rot: float = 0.0,
     **kwargs
 ) -> Dict[str, torch.Tensor]:
     """
     Takes a pre-rendered HDR image (like a chrome ball) and applies tonemapping.
     This is the "Direct to LDR/LOG" pipeline.
     """
+    cache_fmt = f'ball_mp{max_point}_ls{log_scale}'
     if use_cache:
         if isinstance(env_input, torch.Tensor):
             env_hash = compute_tensor_hash(env_input)
         else:
             env_hash = hashlib.md5(str(env_input).encode()).hexdigest()
-        
-        # Use dummy values for proj-specific params to maintain key structure
-        cached_result = _env_cache.get(env_hash, resolution, 'ball', 1.0, False, 0.0)
+
+        cached_result = _env_cache.get(
+            env_hash, resolution, cache_fmt,
+            env_brightness, env_flip, env_rot,
+        )
         if cached_result is not None:
             logger.debug("Using cached direct tonemap ('ball')")
             return cached_result
 
     H, W = resolution
-    
+
     if isinstance(env_input, str):
         env_proj = load_hdr_file(env_input).to(device)
     elif isinstance(env_input, torch.Tensor):
         env_proj = process_comfyui_tensor(env_input).to(device)
     else:
         raise ValueError(f"Unsupported input type: {type(env_input)}")
-    
+
+    env_proj = apply_hdr_preprocessing(
+        env_proj, env_brightness, env_flip, env_rot, device,
+    )
+
     if env_proj.shape[:2] != (H, W):
         env_proj = torch.nn.functional.interpolate(
             env_proj.permute(2, 0, 1).unsqueeze(0),
             size=(H, W), mode='bilinear', align_corners=False
         ).squeeze(0).permute(1, 2, 0)
-    
-    mapping_results = hdr_mapping_official(env_proj, log_scale=10000.0)
-    
+
+    mapping_results = hdr_mapping_official(
+        env_proj, max_point=max_point, log_scale=log_scale,
+    )
+
     env_ldr = mapping_results['env_ev0']
     env_log = mapping_results['env_log']
-    
+
     if num_frames > 1:
         env_ldr = env_ldr.unsqueeze(0).expand(num_frames, -1, -1, -1)
         env_log = env_log.unsqueeze(0).expand(num_frames, -1, -1, -1)
     else:
         env_ldr = env_ldr.unsqueeze(0)
         env_log = env_log.unsqueeze(0)
-    
+
     result = {'env_ldr': env_ldr, 'env_log': env_log}
-    
+
     if use_cache:
-        # Use dummy values for proj-specific params to maintain key structure
-        _env_cache.put(env_hash, resolution, 'ball', 1.0, False, 0.0, result)
-        
+        _env_cache.put(
+            env_hash, resolution, cache_fmt,
+            env_brightness, env_flip, env_rot, result,
+        )
+
     return result
 
 def clear_environment_cache():

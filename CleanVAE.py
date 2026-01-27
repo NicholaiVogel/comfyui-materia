@@ -61,7 +61,11 @@ class CleanVAE:
             state_5d = state_5d.to(torch.float32)
         
         encoded = self.model.encode(state_5d)
-        latent = encoded.latent_dist.sample()
+        # Use .mode (deterministic mean) instead of .sample() (stochastic)
+        # NVIDIA's JIT tokenizer returns deterministic output from the encoder
+        # network. Using .sample() adds random noise that masks subtle condition
+        # differences (e.g. env map param changes) and degrades quality.
+        latent = encoded.latent_dist.mode()
         
         # Return in original dtype if needed by downstream model
         if input_dtype != torch.float32:

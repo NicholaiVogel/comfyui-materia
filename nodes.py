@@ -29,9 +29,12 @@ from .preprocess_envmap import (
     render_projection_from_panorama,
     tonemap_image_direct,
     latlong_vec,
+    envmap_vec,
     clear_environment_cache,
     get_cache_stats,
     load_hdr_file,
+    process_comfyui_tensor,
+    rgb2srgb_official,
 )
 
 # Extracted utilities from the original codebase without dependencies
@@ -165,6 +168,8 @@ class Cosmos1InverseRenderer:
             "optional": {
                 "guidance": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10.0, "step": 0.1}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
+                "num_steps": ("INT", {"default": 15, "min": 1, "max": 100, "step": 1,
+                    "tooltip": "Denoising steps. More = better quality, slower."}),
             }
         }
 
@@ -173,10 +178,11 @@ class Cosmos1InverseRenderer:
     FUNCTION = "run_inverse_pass"
     CATEGORY = "Materia"
 
-    def run_inverse_pass(self, pipeline, image, guidance=0.0, seed=42):
+    def run_inverse_pass(self, pipeline, image, guidance=2.0, seed=42, num_steps=15):
         pipeline.set_model_type("inverse")
         pipeline.guidance = guidance
         pipeline.seed = seed
+        pipeline.num_steps = num_steps
 
         # === ROBUST INPUT HANDLING ===
         pad_frames = 0
@@ -278,10 +284,18 @@ class Cosmos1ForwardRenderer:
             "optional": {
                 "guidance": ("FLOAT", {"default": 2.0, "min": 0.0, "max": 10.0, "step": 0.1}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
-                "env_format": (["proj", "ball"], {"default": "proj"}),
-                "env_brightness": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1}),
+                "num_steps": ("INT", {"default": 15, "min": 1, "max": 100, "step": 1,
+                    "tooltip": "Denoising steps. More = better quality, slower."}),
+                "env_format": (["proj", "ball", "direct"], {"default": "proj",
+                    "tooltip": "proj: HDR cubemap projection. ball: direct tonemap. direct: passthrough (no tonemap/projection)."}),
+                "env_brightness": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1,
+                    "tooltip": "HDR intensity multiplier (applied before tonemapping)"}),
                 "env_flip_horizontal": ("BOOLEAN", {"default": False}),
                 "env_rotation": ("FLOAT", {"default": 180.0, "min": 0, "max": 360, "step": 1.0}),
+                "max_point": ("FLOAT", {"default": 16.0, "min": 0.1, "max": 100.0, "step": 0.5,
+                    "tooltip": "Reinhard white point. Higher = more HDR highlight detail preserved."}),
+                "log_scale": ("FLOAT", {"default": 10000.0, "min": 1.0, "max": 100000.0, "step": 100.0,
+                    "tooltip": "Log encoding scale for env_log channel. Higher = more compression."}),
             }
         }
 
@@ -289,13 +303,15 @@ class Cosmos1ForwardRenderer:
     FUNCTION = "run_forward_pass"
     CATEGORY = "Materia"
 
-    def run_forward_pass(self, pipeline, depth, normal, roughness, metallic, base_color, env_map, 
-                        guidance=0.0, seed=42, env_format="proj", env_brightness=1.0, 
-                        env_flip_horizontal=False, env_rotation=0.0):
-        
+    def run_forward_pass(self, pipeline, depth, normal, roughness, metallic, base_color, env_map,
+                        guidance=2.0, seed=42, num_steps=15, env_format="proj",
+                        env_brightness=1.0, env_flip_horizontal=False,
+                        env_rotation=180.0, max_point=16.0, log_scale=10000.0):
+
         pipeline.set_model_type("forward")
         pipeline.guidance = guidance
         pipeline.seed = seed
+        pipeline.num_steps = num_steps
 
         gbuffer_tensors_in = {
             "depth": depth, "normal": normal, "roughness": roughness,
@@ -355,25 +371,88 @@ class Cosmos1ForwardRenderer:
         if env_format == 'proj':
             print("[Nodes] Processing env_map as panoramic projection ('proj' mode).")
             envlight_dict = render_projection_from_panorama(
-                env_input=env_map, resolution=(H, W), num_frames=T, device=device,
-                env_brightness=env_brightness, env_flip=env_flip_horizontal, env_rot=env_rotation
+                env_input=env_map, resolution=(H, W), num_frames=T,
+                device=device, env_brightness=env_brightness,
+                env_flip=env_flip_horizontal, env_rot=env_rotation,
+                max_point=max_point, log_scale=log_scale,
             )
         elif env_format == 'ball':
-            print("[Nodes] Processing env_map as a direct tonemap of a pre-rendered ball ('ball' mode).")
+            print("[Nodes] Processing env_map as direct tonemap ('ball' mode).")
             if H != W:
-                logging.warning(f"Ball mode expects a square input, but G-buffers are {W}x{H}. Results may be distorted.")
+                logging.warning(
+                    f"Ball mode expects square input, "
+                    f"but G-buffers are {W}x{H}."
+                )
             envlight_dict = tonemap_image_direct(
-                env_input=env_map, resolution=(H, W), num_frames=T, device=device
+                env_input=env_map, resolution=(H, W), num_frames=T,
+                device=device, max_point=max_point, log_scale=log_scale,
+                env_brightness=env_brightness,
+                env_flip=env_flip_horizontal, env_rot=env_rotation,
             )
+        elif env_format == 'direct':
+            print("[Nodes] Processing env_map in 'direct' mode "
+                  "(passthrough, no tonemap/projection).")
+            env_tensor = process_comfyui_tensor(env_map).to(device).float()
+            if env_brightness != 1.0:
+                env_tensor = env_tensor * env_brightness
+            if env_flip_horizontal:
+                env_tensor = torch.flip(env_tensor, dims=[1])
+            if env_rotation != 0:
+                env_w = env_tensor.shape[1]
+                pixel_rot = int(env_w * env_rotation / 360)
+                env_tensor = torch.roll(
+                    env_tensor, shifts=pixel_rot, dims=1,
+                )
+            if env_tensor.shape[0] != H or env_tensor.shape[1] != W:
+                env_tensor = torch.nn.functional.interpolate(
+                    env_tensor.permute(2, 0, 1).unsqueeze(0),
+                    size=(H, W), mode='bilinear', align_corners=False,
+                ).squeeze(0).permute(1, 2, 0)
+            env_ldr_frame = env_tensor.clamp(0, 1)
+            env_log_frame = rgb2srgb_official(
+                torch.log1p(env_tensor.clamp(min=0))
+                / np.log1p(log_scale)
+            ).clamp(0, 1)
+            if T > 1:
+                env_ldr_out = env_ldr_frame.unsqueeze(0).expand(
+                    T, -1, -1, -1)
+                env_log_out = env_log_frame.unsqueeze(0).expand(
+                    T, -1, -1, -1)
+            else:
+                env_ldr_out = env_ldr_frame.unsqueeze(0)
+                env_log_out = env_log_frame.unsqueeze(0)
+            envlight_dict = {
+                'env_ldr': env_ldr_out, 'env_log': env_log_out,
+            }
 
-        env_ldr = envlight_dict['env_ldr'].permute(3, 0, 1, 2).unsqueeze(0) * 2.0 - 1.0
-        env_log = envlight_dict['env_log'].permute(3, 0, 1, 2).unsqueeze(0) * 2.0 - 1.0
-        env_nrm = latlong_vec(res=(H, W), device=device).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
+        env_ldr = (envlight_dict['env_ldr']
+                   .permute(3, 0, 1, 2).unsqueeze(0) * 2.0 - 1.0)
+        env_log = (envlight_dict['env_log']
+                   .permute(3, 0, 1, 2).unsqueeze(0) * 2.0 - 1.0)
+        env_nrm_01 = envmap_vec(res=(H, W), device=device) * 0.5 + 0.5
+        env_nrm = (env_nrm_01.permute(2, 0, 1)
+                   .unsqueeze(0).unsqueeze(2) * 2.0 - 1.0)
 
         data_batch['env_ldr'] = env_ldr.expand(B, -1, -1, -1, -1)
         data_batch['env_log'] = env_log.expand(B, -1, -1, -1, -1)
         data_batch['env_nrm'] = env_nrm.expand(B, -1, T, -1, -1)
 
+        print(f"[Nodes] env_format={env_format}, max_point={max_point}, "
+              f"log_scale={log_scale}, brightness={env_brightness}")
+        print(f"[Nodes] env_ldr range: "
+              f"[{envlight_dict['env_ldr'].min():.3f}, "
+              f"{envlight_dict['env_ldr'].max():.3f}]")
+        print(f"[Nodes] env_log range: "
+              f"[{envlight_dict['env_log'].min():.3f}, "
+              f"{envlight_dict['env_log'].max():.3f}]")
+        print(f"[Nodes] env_nrm range (post-norm): "
+              f"[{env_nrm.min():.3f}, {env_nrm.max():.3f}]")
+        env_hash = hash(
+            (data_batch['env_ldr'].sum().item(),
+             data_batch['env_log'].sum().item())
+        )
+        print(f"[Nodes] env condition hash: {env_hash:#018x} "
+              "(should change when env params change)")
         print("[Nodes] Data batch prepared. Calling diffusion pipeline...")
         pipeline.to_gpu()
         output_array = pipeline.generate_video(data_batch=data_batch, seed=seed)

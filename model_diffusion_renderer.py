@@ -254,7 +254,7 @@ class CleanDiffusionRendererModel(nn.Module):
         
         # Calculate latent shape (with temporal and spatial compression)
         # For VAE with spatial_compression_factor=8 and temporal=1 for images
-        latent_t = T // 8 + 1 if T > 1 else 1  # Temporal compression for videos
+        latent_t = 1 if T == 1 else (T - 1) // 8 + 1
         latent_h = H // 8      # Spatial compression
         latent_w = W // 8      # Spatial compression
         latent_shape = (B, 16, latent_t, latent_h, latent_w)  # 16 latent channels

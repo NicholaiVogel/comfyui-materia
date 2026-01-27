@@ -20,14 +20,18 @@ from .pretrained_vae import VideoJITTokenizer, JointImageVideoTokenizer
 
 from .diffusion_renderer_pipeline import CleanDiffusionRendererPipeline
 from .model_diffusion_renderer import CleanDiffusionRendererModel
-from .diffusion_renderer_config import get_inverse_renderer_config
+from .diffusion_renderer_config import (
+    get_inverse_renderer_config,
+    get_forward_renderer_config,
+)
 
 from .preprocess_envmap import (
     render_projection_from_panorama,
     tonemap_image_direct,
     latlong_vec,
     clear_environment_cache,
-    get_cache_stats
+    get_cache_stats,
+    load_hdr_file,
 )
 
 # Extracted utilities from the original codebase without dependencies
@@ -58,6 +62,17 @@ def pil_to_tensor(image):
         tensor = tensor.permute(0, 3, 1, 2)
     return tensor
 
+def validate_frame_count(num_frames):
+    """Ensure frame count is valid for Cosmos VAE (T=1 or T=1+8k).
+    Returns the next valid count if invalid, padding up."""
+    if num_frames == 1:
+        return 1
+    if (num_frames - 1) % 8 == 0:
+        return num_frames
+    next_valid = ((num_frames - 1) // 8 + 1) * 8 + 1
+    return next_valid
+
+
 class LoadDiffusionRendererModel:
     @classmethod
     def INPUT_TYPES(s):
@@ -85,17 +100,15 @@ class LoadDiffusionRendererModel:
         if not os.path.isdir(image_vae_subfolder_path):
             raise FileNotFoundError(f"Image VAE subfolder not found at: {image_vae_subfolder_path}")
 
-        # We load one VAE and wrap it. This VAE handles both images (T=1) and videos.
+        # VAE stays on CPU until inference needs it.
         vae_instance = CleanVAE(model_path=image_vae_subfolder_path)
-        vae_instance.to(device)
         vae_instance.reset_dtype(dtype)
-        print("✅ Universal VAE loaded successfully via from_pretrained.")
+        print("VAE loaded (CPU, will move to GPU during inference)")
 
         # --- MEMORY-EFFICIENT MODEL LOADING ---
-        # Load and prepare on CPU first, then transfer to GPU in
-        # bfloat16. The original code did to_empty(device=cuda) which
-        # tries to allocate float32 on GPU (~28GB for 7B params) before
-        # dtype conversion -- this exceeds 24GB VRAM on RTX 3090.
+        # Both models stay on CPU. The pipeline moves the active
+        # model to GPU just-in-time for inference and back to CPU
+        # afterward, so two 7B models can coexist on a 24GB card.
         checkpoint_path = folder_paths.get_full_path("diffusion_models", model)
 
         print(f"Loading checkpoint to CPU from: {checkpoint_path}")
@@ -105,43 +118,27 @@ class LoadDiffusionRendererModel:
         if "model" in state_dict:
             state_dict = state_dict["model"]
 
+        is_forward = "net.context_embedding.weight" not in state_dict
+        if is_forward:
+            print("Detected forward renderer checkpoint")
+            basic_config = get_forward_renderer_config()
+        else:
+            print("Detected inverse renderer checkpoint")
+            basic_config = get_inverse_renderer_config()
+
         print("Instantiating model skeleton on 'meta' device...")
-        basic_config = get_inverse_renderer_config()
         with torch.device("meta"):
             model_instance = CleanDiffusionRendererModel(basic_config)
 
-        # Materialize all meta tensors on CPU (not GPU!) then convert
-        # to bfloat16 before loading weights. Peak CPU RAM is ~28GB
-        # during to_empty (float32), drops to ~14GB after dtype
-        # conversion.
         model_instance.to_empty(device='cpu')
         model_instance.to(dtype=dtype)
         model_instance.load_state_dict(state_dict, strict=True)
         del state_dict
 
-        # Recompute non-persistent positional embedding buffers that
-        # were lost during meta-device construction + to_empty().
         model_instance.net.reinit_non_persistent_buffers()
-
-        # Offload VAE to CPU so the full 24GB is available for the
-        # diffusion model transfer.
-        vae_was_on_gpu = next(
-            vae_instance.model.parameters()
-        ).device.type == 'cuda'
-        if vae_was_on_gpu:
-            print("Offloading VAE to CPU for model transfer...")
-            vae_instance.to('cpu')
-            torch.cuda.empty_cache()
-
-        model_instance.to(device=device)
-
-        if vae_was_on_gpu:
-            vae_instance.to(device)
-
-        mm.soft_empty_cache()
         model_instance.requires_grad_(False)
         model_instance.train(False)
-        print(f"Model loaded to {device} in {dtype}")
+        print(f"Model loaded (CPU, {dtype})")
 
         pipeline = CleanDiffusionRendererPipeline(
             checkpoint_dir=os.path.dirname(checkpoint_path),
@@ -181,43 +178,58 @@ class Cosmos1InverseRenderer:
         pipeline.guidance = guidance
         pipeline.seed = seed
 
-        # === ROBUST INPUT HANDLING START ===
-        print(f"[Nodes] Received input of type: {type(image)}")
+        # === ROBUST INPUT HANDLING ===
+        pad_frames = 0
         if isinstance(image, list):
-            print(f"[Nodes] Input is a list. Stacking {len(image)} tensors.")
             try:
                 image_5d = torch.stack(image, dim=0)
             except Exception as e:
-                print(f"Warning: Could not stack tensors in list due to varying shapes: {e}. Processing first item only.")
+                print(f"Warning: Could not stack list: {e}. "
+                      f"Using first item only.")
                 image_5d = image[0].unsqueeze(0)
-        
         elif isinstance(image, torch.Tensor):
             if image.ndim == 3:
-                print("[Nodes] Input is a 3D tensor (H,W,C). Adding Batch and Time dimensions.")
                 image_5d = image.unsqueeze(0).unsqueeze(0)
             elif image.ndim == 4:
-                print("[Nodes] Input is a 4D tensor. Assuming (B,H,W,C) and adding Time dimension.")
-                image_5d = image.unsqueeze(1)
+                B = image.shape[0]
+                if B == 1:
+                    image_5d = image.unsqueeze(1)  # (1,1,H,W,C)
+                else:
+                    image_5d = image.unsqueeze(0)  # (1,B,H,W,C) — B=T
+                    T = image_5d.shape[1]
+                    valid_T = validate_frame_count(T)
+                    if valid_T != T:
+                        pad_frames = valid_T - T
+                        last_frame = image_5d[:, -1:].expand(
+                            -1, pad_frames, -1, -1, -1
+                        )
+                        image_5d = torch.cat(
+                            [image_5d, last_frame], dim=1
+                        )
+                        print(f"[Nodes] Padded {T} frames → {valid_T} "
+                              f"(+{pad_frames} duplicated last frame)")
             elif image.ndim == 5:
-                print("[Nodes] Input is a 5D tensor (B,T,H,W,C). Using as is.")
                 image_5d = image
             else:
-                raise ValueError(f"Unsupported tensor dimension: {image.ndim}. Expected 3D, 4D, or 5D.")
+                raise ValueError(
+                    f"Unsupported tensor dimension: {image.ndim}")
         else:
-            raise TypeError(f"Unsupported input type: {type(image)}. Expected torch.Tensor or list of Tensors.")
+            raise TypeError(
+                f"Unsupported input type: {type(image)}")
 
-        print(f"[Nodes] Standardized input to 5D tensor with shape: {image_5d.shape}")
+        print(f"[Nodes] Input shape: {image_5d.shape} (B,T,H,W,C)")
 
         # === PRE-PROCESSING FOR MODEL ===
         image_tensor = image_5d.permute(0, 4, 1, 2, 3)
         image_tensor = image_tensor * 2.0 - 1.0
         print(f"[Nodes] Pre-processed input for model with shape: {image_tensor.shape}")
         
-        # === INFERENCE LOGIC (NOW BATCH-EFFICIENT) ===
+        # === INFERENCE ===
         inference_passes = ["basecolor", "metallic", "roughness", "normal", "depth"]
         outputs = {}
         pbar = ProgressBar(len(inference_passes))
 
+        pipeline.to_gpu()
         for gbuffer_pass in inference_passes:
             context_index = GBUFFER_INDEX_MAPPING[gbuffer_pass]
             
@@ -237,10 +249,15 @@ class Cosmos1InverseRenderer:
             output_tensor = torch.from_numpy(output_array).float() / 255.0
 
             b, t, h, w, c = output_tensor.shape
+            if pad_frames > 0:
+                t = t - pad_frames
+                output_tensor = output_tensor[:, :t]
             output_tensor_4d = output_tensor.reshape(b * t, h, w, c)
 
             outputs[gbuffer_pass] = output_tensor_4d
             pbar.update(1)
+
+        pipeline.to_cpu()
 
         return (outputs["basecolor"], outputs["metallic"], outputs["roughness"], outputs["normal"], outputs["depth"])
 
@@ -286,15 +303,39 @@ class Cosmos1ForwardRenderer:
         }
         
         gbuffer_tensors_5d = {}
+        pad_frames = 0
         for name, tensor_in in gbuffer_tensors_in.items():
             if isinstance(tensor_in, list):
                 tensor_5d = torch.stack(tensor_in, dim=0)
             elif isinstance(tensor_in, torch.Tensor):
-                if tensor_in.ndim == 3: tensor_5d = tensor_in.unsqueeze(0).unsqueeze(0)
-                elif tensor_in.ndim == 4: tensor_5d = tensor_in.unsqueeze(1)
-                elif tensor_in.ndim == 5: tensor_5d = tensor_in
-                else: raise ValueError(f"Unsupported tensor dimension for '{name}': {tensor_in.ndim}")
-            else: raise TypeError(f"Unsupported input type for '{name}': {type(tensor_in)}")
+                if tensor_in.ndim == 3:
+                    tensor_5d = tensor_in.unsqueeze(0).unsqueeze(0)
+                elif tensor_in.ndim == 4:
+                    B = tensor_in.shape[0]
+                    if B == 1:
+                        tensor_5d = tensor_in.unsqueeze(1)
+                    else:
+                        tensor_5d = tensor_in.unsqueeze(0)
+                        T = tensor_5d.shape[1]
+                        valid_T = validate_frame_count(T)
+                        if valid_T != T:
+                            pad_frames = valid_T - T
+                            last = tensor_5d[:, -1:].expand(
+                                -1, pad_frames, -1, -1, -1
+                            )
+                            tensor_5d = torch.cat(
+                                [tensor_5d, last], dim=1
+                            )
+                elif tensor_in.ndim == 5:
+                    tensor_5d = tensor_in
+                else:
+                    raise ValueError(
+                        f"Unsupported dim for '{name}': "
+                        f"{tensor_in.ndim}")
+            else:
+                raise TypeError(
+                    f"Unsupported type for '{name}': "
+                    f"{type(tensor_in)}")
             gbuffer_tensors_5d[name] = tensor_5d
         
         B, T, H, W, C = gbuffer_tensors_5d["depth"].shape
@@ -327,15 +368,24 @@ class Cosmos1ForwardRenderer:
 
         env_ldr = envlight_dict['env_ldr'].permute(3, 0, 1, 2).unsqueeze(0) * 2.0 - 1.0
         env_log = envlight_dict['env_log'].permute(3, 0, 1, 2).unsqueeze(0) * 2.0 - 1.0
-        env_nrm = latlong_vec(resolution=(H, W), device=device).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
+        env_nrm = latlong_vec(res=(H, W), device=device).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
 
         data_batch['env_ldr'] = env_ldr.expand(B, -1, -1, -1, -1)
         data_batch['env_log'] = env_log.expand(B, -1, -1, -1, -1)
         data_batch['env_nrm'] = env_nrm.expand(B, -1, T, -1, -1)
 
         print("[Nodes] Data batch prepared. Calling diffusion pipeline...")
+        pipeline.to_gpu()
         output_array = pipeline.generate_video(data_batch=data_batch, seed=seed)
-        final_output = torch.from_numpy(output_array).float() / 255.0
+        pipeline.to_cpu()
+
+        output_tensor = torch.from_numpy(output_array).float() / 255.0
+
+        b, t, h, w, c = output_tensor.shape
+        if pad_frames > 0:
+            t = t - pad_frames
+            output_tensor = output_tensor[:, :t]
+        final_output = output_tensor.reshape(b * t, h, w, c)
 
         return (final_output,)
 
@@ -353,12 +403,7 @@ class LoadHDRImage:
     CATEGORY = "Materia"
 
     def load_hdr(self, path):
-        img = imageio.imread(path, format='HDR-FI')
-        if img.ndim == 2:
-            img = np.stack([img]*3, axis=-1)
-        elif img.ndim == 3 and img.shape[2] == 1:
-            img = np.repeat(img, 3, axis=2)
-        tensor = torch.from_numpy(img).float().unsqueeze(0)
+        tensor = load_hdr_file(path).unsqueeze(0)
         return (tensor,)
     
 class VAEPassthroughTest:

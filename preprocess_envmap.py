@@ -348,9 +348,6 @@ def rotate_y(angle: float, device: str = 'cuda') -> torch.Tensor:
     ], dtype=torch.float32, device=device)
 
 
-    
-    return sampled.squeeze(0).permute(1, 2, 0)  # (H, W, C)
-
 
 def get_ref_vector(normal: torch.Tensor, incoming_vector: np.ndarray) -> torch.Tensor:
     """Compute reflection vectors for chrome ball"""

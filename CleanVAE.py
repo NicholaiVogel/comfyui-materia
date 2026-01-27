@@ -14,7 +14,7 @@ class CleanVAE:
         
         # FIX: Use underscore version consistently
         self._spatial_compression_factor = self.model.config.spatial_compression_ratio
-        self._temporal_compression_factor = 1  # 1 for images, 8 for videos
+        self._temporal_compression_factor = 8
         self.latent_ch = self.config.latent_channels
         
         # Always use float32 for quality

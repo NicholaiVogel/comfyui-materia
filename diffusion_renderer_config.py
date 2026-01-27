@@ -143,20 +143,20 @@ def get_inverse_renderer_config(
     # Calculate latent dimensions
     latent_h = height // 8  # 88 for 704
     latent_w = width // 8   # 160 for 1280
-    latent_t = num_frames // 8 + 1  # 8 for 57 frames
-    
+    latent_t = 1 if num_frames == 1 else (num_frames - 1) // 8 + 1
+
     base_config = CleanDiffusionRendererConfig()
     network_config = get_network_config()
-    
+
     config = {
         # Model parameters
         "sigma_data": base_config.sigma_data,
         "precision": base_config.precision,
         "input_data_key": base_config.input_data_key,
-        
+
         # Latent shape [C, T, H, W]
         "latent_shape": [16, latent_t, latent_h, latent_w],
-        
+
         # Condition handling - Inverse takes RGB input
         "condition_keys": ["rgb"],
         "condition_drop_rate": 0.1,
@@ -203,42 +203,43 @@ def get_forward_renderer_config(
     # Calculate latent dimensions
     latent_h = height // 8  # 88 for 704
     latent_w = width // 8   # 160 for 1280
-    latent_t = num_frames // 8 + 1  # 8 for 57 frames
-    
+    latent_t = 1 if num_frames == 1 else (num_frames - 1) // 8 + 1
+
     base_config = CleanDiffusionRendererConfig()
     network_config = get_network_config()
-    
+
     config = {
         # Model parameters
         "sigma_data": base_config.sigma_data,
         "precision": base_config.precision,
         "input_data_key": base_config.input_data_key,
-        
-        # Latent shape [C, T, H, W]  
+
+        # Latent shape [C, T, H, W]
         "latent_shape": [16, latent_t, latent_h, latent_w],
-        
+
         # Condition handling - Forward takes all G-buffer maps + environment
         "condition_keys": [
             "basecolor", "normal", "metallic", "roughness", "depth",
             "env_ldr", "env_log", "env_nrm"
         ],
         "condition_drop_rate": 0.05,
-        "append_condition_mask": False,
+        "append_condition_mask": True,
         
         # Network architecture
+        # 8 conditions * (16 latent ch + 1 mask ch) = 136
         "net": {
             **network_config,
-            "additional_concat_ch": 16,  
-            "use_context_embedding": True,
-            "crossattn_emb_channels": 1024,  # FIXED: Must match checkpoint expectation!
+            "additional_concat_ch": 136,
+            "use_context_embedding": False,
+            "crossattn_emb_channels": 1024,
         },
-        
+
         # Scheduler
         "scheduler": get_scheduler_config(),
-        
+
         # VAE/Tokenizer
         "vae": get_vae_config(num_frames),
-        
+
         # Inference parameters
         "guidance": 2.0,
         "num_steps": 20,
@@ -246,7 +247,7 @@ def get_forward_renderer_config(
         "width": width,
         "num_video_frames": num_frames,
     }
-    
+
     return config
 
 

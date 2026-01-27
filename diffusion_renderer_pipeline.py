@@ -98,6 +98,24 @@ class CleanDiffusionRendererPipeline:
         print(f"  Pre-loaded VAE: {'✅ Yes' if vae_instance else '❌ No'}")
         print(f"  Note: Actual dimensions will be inferred from input tensors")
     
+    def to_gpu(self):
+        """Move model + VAE to GPU for inference."""
+        import torch.cuda
+        torch.cuda.empty_cache()
+        if self.vae_instance is not None:
+            self.vae_instance.to(self.device)
+        if self.pre_loaded_model_instance is not None:
+            self.pre_loaded_model_instance.to(self.device)
+
+    def to_cpu(self):
+        """Offload model + VAE to CPU to free VRAM."""
+        import torch.cuda
+        if self.pre_loaded_model_instance is not None:
+            self.pre_loaded_model_instance.to('cpu')
+        if self.vae_instance is not None:
+            self.vae_instance.to('cpu')
+        torch.cuda.empty_cache()
+
     def set_model_type(self, model_type: str):
         """Set model type and force model reload if type changes"""
         new_model_type = model_type.lower()
@@ -187,15 +205,11 @@ class CleanDiffusionRendererPipeline:
         
         # CRITICAL: Set the VAE instance
         if self.vae_instance:
-            print("✅ Using pre-loaded VAE instance")
             model_instance.vae = self.vae_instance
         else:
-            print("⚠️ No VAE instance provided - model may not work correctly")
-        
-        # Ensure model is on correct device
-        model_instance = model_instance.to(self.device)
-        
-        print("✅ Pre-loaded model reconfigured successfully")
+            print("WARNING: No VAE instance provided")
+
+        print("Pre-loaded model reconfigured (still on CPU)")
         return model_instance
     
     def _load_model_with_config(self):
@@ -263,7 +277,7 @@ class CleanDiffusionRendererPipeline:
         
         # 1. Move data to device
         data_batch = self._move_to_device(data_batch)
-        
+
         # 2. Find video tensor and infer dimensions
         possible_shape_keys = ['rgb', 'image', 'basecolor', 'normal', 'depth', 'roughness', 'metallic']
         
@@ -288,7 +302,7 @@ class CleanDiffusionRendererPipeline:
         C, expected_T, expected_H, expected_W = config_latent_shape
         
         B, input_C, input_T, input_H, input_W = video_tensor.shape
-        F = (input_T - 1) // 8 + 1  # Temporal compression
+        F = 1 if input_T == 1 else (input_T - 1) // 8 + 1
         H = input_H // 8  # Spatial compression  
         W = input_W // 8  # Spatial compression
         state_shape = [C, F, H, W]
@@ -334,5 +348,5 @@ class CleanDiffusionRendererPipeline:
         video = video.permute(0, 2, 3, 4, 1)
         video = (video * 255).to(torch.uint8).cpu().numpy()
         print(f"[Pipeline] Final numpy output shape: {video.shape}")
-        
+
         return video

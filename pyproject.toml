@@ -1,0 +1,34 @@
+[project]
+name = "comfyui-materia"
+description = "ComfyUI custom nodes for PBR material decomposition and physically-based relighting using NVIDIA's Cosmos Diffusion Renderer (7B). Decomposes RGB images into PBR material maps (base color, metallic, roughness, normal, depth) and relights subjects under new HDR environments."
+version = "1.0.0"
+license = { file = "LICENSE" }
+dependencies = [
+    "numpy>=1.23.0",
+    "diffusers>=0.33.0",
+    "Pillow>=9.0.0",
+    "imageio>=2.22.0",
+    "opencv-python>=4.7.0",
+    "einops>=0.6.0",
+    "safetensors>=0.3.0",
+    "typing-extensions>=4.0.0",
+    "diffrp-nvdiffrast>=0.3.0",
+]
+
+classifiers = [
+  "Operating System :: OS Independent",
+  "Environment :: GPU :: NVIDIA CUDA",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Repository = "https://github.com/NicholaiVogel/comfyui-materia"
+Documentation = "https://github.com/NicholaiVogel/comfyui-materia/blob/main/README.md"
+"Bug Tracker" = "https://github.com/NicholaiVogel/comfyui-materia/issues"
+
+[tool.comfy]
+PublisherId = "NicholaiVogel"
+DisplayName = "Materia - PBR Material Decomposition"

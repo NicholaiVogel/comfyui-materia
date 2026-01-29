@@ -1,16 +1,19 @@
 @echo off
-
-set "requirements_txt=%~dp0\requirements.txt"
-set "python_exec=..\..\..\python_embeded\python.exe"
-
-echo Installing Materia requirements...
-
-if exist "%python_exec%" (
-    echo Installing with ComfyUI Portable
-    "%python_exec%" -s -m pip install -r "%requirements_txt%"
-) else (
-    echo Installing with system Python
-    pip install -r "%requirements_txt%"
-)
-
+echo =====================================================
+echo   This installer is deprecated and no longer supported
+echo =====================================================
+echo.
+echo Please use the new Python installer instead:
+echo.
+echo   python install.py
+echo.
+echo The new installer handles:
+echo   - Automatic Python environment detection
+echo   - Version validation (diffusers >= 0.33.0)
+echo   - nvdiffrast installation with fallbacks
+echo   - Post-install verification
+echo.
+echo For Windows-specific issues, see TROUBLESHOOTING-WINDOWS.md
+echo =====================================================
+echo.
 pause

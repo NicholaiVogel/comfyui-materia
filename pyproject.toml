@@ -13,6 +13,7 @@ dependencies = [
     "safetensors>=0.3.0",
     "typing-extensions>=4.0.0",
     "diffrp-nvdiffrast>=0.3.0",
+    "ninja>=1.10.0",
 ]
 
 classifiers = [

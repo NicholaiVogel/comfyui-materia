@@ -298,6 +298,7 @@ def verify_installation(python_exec: str) -> bool:
         ("diffusers", "from diffusers import AutoencoderKLCosmos"),
         ("PIL", "from PIL import Image"),
         ("safetensors", "import safetensors"),
+        ("OpenEXR", "import OpenEXR"),
     ]
 
     all_passed = True

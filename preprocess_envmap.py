@@ -15,8 +15,16 @@ import hashlib
 import time
 import nvdiffrast.torch as dr
 
-# Enable OpenEXR support
+# Enable OpenEXR support for cv2 (only works if compiled with OpenEXR)
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+
+# Try to import OpenEXR package (works on Windows unlike cv2's OpenEXR)
+try:
+    import OpenEXR
+    import Imath
+    _HAS_OPENEXR = True
+except ImportError:
+    _HAS_OPENEXR = False
 
 logger = logging.getLogger(__name__)
 
@@ -207,43 +215,144 @@ def latlong_to_cubemap_official(latlong_map: torch.Tensor, res: List[int]) -> to
     
     return cubemap
 
-def load_hdr_file(file_path: str) -> torch.Tensor:
-    """Load HDR file with OpenEXR support"""
+def _load_exr_native(file_path: str) -> Optional[np.ndarray]:
+    """
+    Load EXR file using the OpenEXR package (Academy Software Foundation).
+    Works on Windows where cv2's OpenEXR support is typically unavailable.
+
+    Returns:
+        numpy array (H, W, 3) float32 or None if loading fails
+    """
+    if not _HAS_OPENEXR:
+        return None
+
     try:
-        # Try imageio with OpenEXR plugin first
-        img = imageio_v3.imread(file_path, flags=cv2.IMREAD_UNCHANGED, plugin='opencv')
-        if img is None:
-            raise ValueError(f"Failed to load with imageio: {file_path}")
+        exr_file = OpenEXR.InputFile(file_path)
+        header = exr_file.header()
+
+        dw = header['dataWindow']
+        width = dw.max.x - dw.min.x + 1
+        height = dw.max.y - dw.min.y + 1
+
+        # Determine channel layout
+        channels = header['channels']
+        channel_names = list(channels.keys())
+
+        # Check for RGB grouped channels (e.g., "RGB.R", "RGB.G", "RGB.B")
+        # or separate channels ("R", "G", "B")
+        if 'R' in channel_names:
+            r_name, g_name, b_name = 'R', 'G', 'B'
+        elif 'RGB.R' in channel_names:
+            r_name, g_name, b_name = 'RGB.R', 'RGB.G', 'RGB.B'
+        else:
+            # Try to find any channels that look like RGB
+            rgb_channels = [c for c in channel_names if c not in ('A', 'alpha', 'Alpha')]
+            if len(rgb_channels) >= 3:
+                r_name, g_name, b_name = rgb_channels[0], rgb_channels[1], rgb_channels[2]
+            else:
+                logger.warning(f"Could not find RGB channels in {file_path}: {channel_names}")
+                return None
+
+        # Determine pixel type (HALF or FLOAT)
+        pixel_type = channels[r_name].type
+        if pixel_type == Imath.PixelType(Imath.PixelType.HALF):
+            np_dtype = np.float16
+        else:
+            np_dtype = np.float32
+
+        # Read channels
+        r_str = exr_file.channel(r_name)
+        g_str = exr_file.channel(g_name)
+        b_str = exr_file.channel(b_name)
+
+        r = np.frombuffer(r_str, dtype=np_dtype).reshape(height, width)
+        g = np.frombuffer(g_str, dtype=np_dtype).reshape(height, width)
+        b = np.frombuffer(b_str, dtype=np_dtype).reshape(height, width)
+
+        # Stack to RGB and convert to float32
+        img = np.stack([r, g, b], axis=-1).astype(np.float32)
+
+        exr_file.close()
+        return img
+
     except Exception as e:
-        logger.warning(f"imageio failed: {e}, trying alternative methods")
-        try:
-            # Fallback to cv2 for EXR files
-            if file_path.lower().endswith('.exr'):
+        logger.warning(f"OpenEXR native loading failed for {file_path}: {e}")
+        return None
+
+
+def load_hdr_file(file_path: str) -> torch.Tensor:
+    """
+    Load HDR file with robust fallback chain.
+
+    For .exr files:
+        1. OpenEXR package (works on Windows, fast, native)
+        2. cv2.imread (works on Linux/Mac with OpenEXR compiled in)
+        3. imageio fallback
+
+    For other HDR files (.hdr, etc):
+        1. cv2.imread
+        2. imageio fallback
+    """
+    img = None
+    is_exr = file_path.lower().endswith('.exr')
+
+    if is_exr:
+        # Try OpenEXR package first (works on Windows)
+        img = _load_exr_native(file_path)
+        if img is not None:
+            logger.debug(f"Loaded EXR with OpenEXR package: {file_path}")
+
+        # Fallback to cv2 (works on Linux/Mac with OpenEXR compiled in)
+        if img is None:
+            try:
                 img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
                 if img is not None:
                     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                else:
-                    raise ValueError(f"cv2 failed to load EXR: {file_path}")
-            else:
-                # Regular imageio for other formats
+                    logger.debug(f"Loaded EXR with cv2: {file_path}")
+            except Exception as e:
+                logger.warning(f"cv2 EXR loading failed: {e}")
+
+        # Final fallback to imageio
+        if img is None:
+            try:
                 img = imageio_v3.imread(file_path)
-        except Exception as e2:
-            raise ValueError(f"All loading methods failed for {file_path}: {e2}")
-    
-    # Convert to tensor
+                logger.debug(f"Loaded EXR with imageio: {file_path}")
+            except Exception as e:
+                raise ValueError(f"All EXR loading methods failed for {file_path}: {e}")
+    else:
+        # Non-EXR HDR files (.hdr, etc) - cv2 first, then imageio
+        try:
+            img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
+            if img is not None:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                logger.debug(f"Loaded HDR with cv2: {file_path}")
+        except Exception as e:
+            logger.warning(f"cv2 HDR loading failed: {e}")
+
+        if img is None:
+            try:
+                img = imageio_v3.imread(file_path)
+                logger.debug(f"Loaded HDR with imageio: {file_path}")
+            except Exception as e:
+                raise ValueError(f"All HDR loading methods failed for {file_path}: {e}")
+
+    if img is None:
+        raise ValueError(f"Failed to load HDR file: {file_path}")
+
+    # Convert to float32
     if img.dtype == np.uint8:
         img = img.astype(np.float32) / 255.0
     elif img.dtype == np.uint16:
         img = img.astype(np.float32) / 65535.0
     else:
         img = img.astype(np.float32)
-    
+
     # Ensure 3 channels
     if img.ndim == 2:
         img = np.stack([img] * 3, axis=-1)
     elif img.shape[-1] == 4:
         img = img[..., :3]  # Remove alpha
-    
+
     return torch.from_numpy(img)
 
 def process_comfyui_tensor(tensor: torch.Tensor) -> torch.Tensor:

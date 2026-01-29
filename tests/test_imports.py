@@ -77,6 +77,7 @@ def test_basic_dependencies():
         ("cv2", "import cv2"),
         ("imageio", "import imageio"),
         ("einops", "import einops"),
+        ("OpenEXR", "import OpenEXR"),
     ]
 
     all_passed = True
